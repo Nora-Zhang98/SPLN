@@ -77,6 +77,7 @@ python3 \
 
 ```
 
+The extracted visual and conceptual prototype files can be downloaded from [here](https://1drv.ms/f/c/60174365786eb250/Eh8cWd-RHsNJrX0O2VR1eVcB1IRe12_OaPTngBqSvBbGtg?e=ANjy7L). Make sure they are in the right path.
 
 ## Device
 
