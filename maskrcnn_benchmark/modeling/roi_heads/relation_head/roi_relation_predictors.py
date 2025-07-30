@@ -126,30 +126,36 @@ class PrototypeEmbeddingNetwork(nn.Module):
             self.mode = 'sgdet'
         
         self.nms_thresh = self.cfg.TEST.RELATION.LATER_NMS_PREDICTION_THRES
-
+        
+        self.sem_pro_mode = self.cfg.MODEL.ROI_RELATION_HEAD.SEM_PRO_MODE
+        self.vis_pro_mode = self.cfg.MODEL.ROI_RELATION_HEAD.VIS_PRO_MODE
+        self.con_pro_mode = self.cfg.MODEL.ROI_RELATION_HEAD.CON_PRO_MODE
+        
         # visual prototype
-        self.vis_W_pred = nn.Linear(self.cfg.MODEL.ROI_RELATION_HEAD.VIS_PRO_DIM, self.mlp_dim)
-        self.vis_protos = torch.load(self.cfg.MODEL.ROI_RELATION_HEAD.VIS_PRO_PATH).cuda() # load initialized visual prototype
-        self.vis_project_head = nn.Linear(self.mlp_dim, self.mlp_dim * 2)
-        self.vis_input_dim = self.cfg.MODEL.ROI_RELATION_HEAD.VIS_VAE_INPUT_DIM
-        self.vis_latent_dim = self.cfg.MODEL.ROI_RELATION_HEAD.VIS_VAE_LATENT_DIM
-        self.vis_vae = VAE_MODEL(self.vis_latent_dim, self.vis_input_dim, len(self.rel_classes)) # visual VAE
-        self.vis_post_embedding = nn.Linear(self.vis_input_dim, self.vis_input_dim)
-        self.vis_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        if self.vis_pro_mode:
+            self.vis_W_pred = nn.Linear(self.cfg.MODEL.ROI_RELATION_HEAD.VIS_PRO_DIM, self.mlp_dim)
+            self.vis_protos = torch.load(self.cfg.MODEL.ROI_RELATION_HEAD.VIS_PRO_PATH).cuda() # load initialized visual prototype
+            self.vis_project_head = nn.Linear(self.mlp_dim, self.mlp_dim * 2)
+            self.vis_input_dim = self.cfg.MODEL.ROI_RELATION_HEAD.VIS_VAE_INPUT_DIM
+            self.vis_latent_dim = self.cfg.MODEL.ROI_RELATION_HEAD.VIS_VAE_LATENT_DIM
+            self.vis_vae = VAE_MODEL(self.vis_latent_dim, self.vis_input_dim, len(self.rel_classes)) # visual VAE
+            self.vis_post_embedding = nn.Linear(self.vis_input_dim, self.vis_input_dim)
+            self.vis_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
         # conceptual prototype
-        self.con_W_pred = nn.Linear(self.cfg.MODEL.ROI_RELATION_HEAD.CON_PRO_DIM, self.mlp_dim * 2)
-
-        if self.cfg.MODEL.ROI_RELATION_HEAD.CON_PRO_TYPE == 'CLIP':
-            self.con_protos = torch.load(self.cfg.MODEL.ROI_RELATION_HEAD.CON_PRO_CLIP_PATH).cuda() # CLIP
-        elif self.cfg.MODEL.ROI_RELATION_HEAD.CON_PRO_TYPE == 'LLAMA':
-            self.con_protos = torch.load(self.cfg.MODEL.ROI_RELATION_HEAD.CON_PRO_LLAMA_PATH).cuda().float() # LLAMA
-
-        self.con_project_head = nn.Linear(self.mlp_dim, self.mlp_dim * 2)
-        self.con_input_dim = self.cfg.MODEL.ROI_RELATION_HEAD.CON_VAE_INPUT_DIM
-        self.con_latent_dim = self.cfg.MODEL.ROI_RELATION_HEAD.CON_VAE_LATENT_DIM
-        self.con_vae = VAE_MODEL(self.con_latent_dim, self.con_input_dim, len(self.rel_classes))  # conceptual VAE
-        self.con_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        if self.con_pro_mode:
+            self.con_W_pred = nn.Linear(self.cfg.MODEL.ROI_RELATION_HEAD.CON_PRO_DIM, self.mlp_dim * 2)
+    
+            if self.cfg.MODEL.ROI_RELATION_HEAD.CON_PRO_TYPE == 'CLIP':
+                self.con_protos = torch.load(self.cfg.MODEL.ROI_RELATION_HEAD.CON_PRO_CLIP_PATH).cuda() # CLIP
+            elif self.cfg.MODEL.ROI_RELATION_HEAD.CON_PRO_TYPE == 'LLAMA':
+                self.con_protos = torch.load(self.cfg.MODEL.ROI_RELATION_HEAD.CON_PRO_LLAMA_PATH).cuda().float() # LLAMA
+    
+            self.con_project_head = nn.Linear(self.mlp_dim, self.mlp_dim * 2)
+            self.con_input_dim = self.cfg.MODEL.ROI_RELATION_HEAD.CON_VAE_INPUT_DIM
+            self.con_latent_dim = self.cfg.MODEL.ROI_RELATION_HEAD.CON_VAE_LATENT_DIM
+            self.con_vae = VAE_MODEL(self.con_latent_dim, self.con_input_dim, len(self.rel_classes))  # conceptual VAE
+            self.con_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
         self.pred_classifier = nn.Linear(self.mlp_dim, self.num_rel_cls)
         self.logit_wt1 = nn.Parameter(torch.rand(1, self.num_rel_cls)).cuda()
@@ -225,72 +231,75 @@ class PrototypeEmbeddingNetwork(nn.Module):
         entity_dists = entity_dists.split(num_objs, dim=0)
 
         # structural prototype
-        sem_predicate_proto = self.W_pred(self.rel_embed.weight)
-        sem_predicate_proto = self.project_head(self.dropout_pred(torch.relu(sem_predicate_proto)))
-        sem_predicate_proto_norm = sem_predicate_proto / sem_predicate_proto.norm(dim=1, keepdim=True)
-
-        sem_rel_rep = self.project_head(self.dropout_rel(torch.relu(rel_rep)))
-        sem_rel_rep_norm = sem_rel_rep / sem_rel_rep.norm(dim=1, keepdim=True)
-
-        sem_rel_dists = sem_rel_rep_norm @ sem_predicate_proto_norm.t() * self.logit_scale.exp()
-        sem_rel_dists = (sem_rel_dists - sem_rel_dists.mean(dim=1).reshape(-1, 1)) / sem_rel_dists.std(dim=1).reshape(-1, 1)
-        rel_dists1 = rel_dists * self.sigmoid(self.logit_wt1) + sem_rel_dists * (1 - self.sigmoid(self.logit_wt1))
-
-        if self.training:
-            # similarity matrix loss
-            target_rpredicate_proto_norm = sem_predicate_proto_norm.clone().detach()
-            simil_mat = sem_predicate_proto_norm @ target_rpredicate_proto_norm.t()  # 51x51，Semantic Matrix S = C_norm @ C_norm.T
-            simi_diff_proto = (simil_mat.sum() - simil_mat.trace()) / (self.num_rel_cls - 1) / (self.num_rel_cls - 1)
-            add_losses.update({"sem_simi_loss": simi_diff_proto})
+        if self.sem_pro_mode:
+            sem_predicate_proto = self.W_pred(self.rel_embed.weight)
+            sem_predicate_proto = self.project_head(self.dropout_pred(torch.relu(sem_predicate_proto)))
+            sem_predicate_proto_norm = sem_predicate_proto / sem_predicate_proto.norm(dim=1, keepdim=True)
+    
+            sem_rel_rep = self.project_head(self.dropout_rel(torch.relu(rel_rep)))
+            sem_rel_rep_norm = sem_rel_rep / sem_rel_rep.norm(dim=1, keepdim=True)
+    
+            sem_rel_dists = sem_rel_rep_norm @ sem_predicate_proto_norm.t() * self.logit_scale.exp()
+            sem_rel_dists = (sem_rel_dists - sem_rel_dists.mean(dim=1).reshape(-1, 1)) / sem_rel_dists.std(dim=1).reshape(-1, 1)
+            rel_dists1 = rel_dists * self.sigmoid(self.logit_wt1) + sem_rel_dists * (1 - self.sigmoid(self.logit_wt1))
+    
+            if self.training:
+                # similarity matrix loss
+                target_rpredicate_proto_norm = sem_predicate_proto_norm.clone().detach()
+                simil_mat = sem_predicate_proto_norm @ target_rpredicate_proto_norm.t()  # 51x51，Semantic Matrix S = C_norm @ C_norm.T
+                simi_diff_proto = (simil_mat.sum() - simil_mat.trace()) / (self.num_rel_cls - 1) / (self.num_rel_cls - 1)
+                add_losses.update({"sem_simi_loss": simi_diff_proto})
 
         # visual prototype
-        vis_predicate_proto = self.vis_W_pred(self.vis_protos)
-        vis_predicate_proto = self.vis_project_head(self.dropout_pred(torch.relu(vis_predicate_proto)))
-        vis_rel_rep = self.vis_project_head(self.dropout_rel(torch.relu(rel_rep)))
+        if self.vis_pro_mode:
+            vis_predicate_proto = self.vis_W_pred(self.vis_protos)
+            vis_predicate_proto = self.vis_project_head(self.dropout_pred(torch.relu(vis_predicate_proto)))
+            vis_rel_rep = self.vis_project_head(self.dropout_rel(torch.relu(rel_rep)))
+    
+            rec_union_features, mu, log_var = self.vis_vae(union_features)
+            vis_residual = union_features - rec_union_features
+            vis_rep = vis_rel_rep + self.vis_post_embedding(vis_residual) # RDRE
+    
+            vis_rep_norm = vis_rep / vis_rep.norm(dim=1, keepdim=True)
+            vis_proto_norm = vis_predicate_proto / vis_predicate_proto.norm(dim=1, keepdim=True)
+    
+            vis_rel_dists = vis_rep_norm @ vis_proto_norm.t() * self.vis_logit_scale.exp()
+            vis_vae_loss = VAE_loss(union_features, rec_union_features, mu, log_var)
+            add_losses.update({"vis_vae_loss": vis_vae_loss})
+    
+            vis_rel_dists = (vis_rel_dists - vis_rel_dists.mean(dim=1).reshape(-1, 1)) / vis_rel_dists.std(dim=1).reshape(-1, 1)
+            rel_dists2 = rel_dists * self.sigmoid(self.logit_wt2) + vis_rel_dists * (1 - self.sigmoid(self.logit_wt2))
 
-        rec_union_features, mu, log_var = self.vis_vae(union_features)
-        vis_residual = union_features - rec_union_features
-        vis_rep = vis_rel_rep + self.vis_post_embedding(vis_residual) # RDRE
-
-        vis_rep_norm = vis_rep / vis_rep.norm(dim=1, keepdim=True)
-        vis_proto_norm = vis_predicate_proto / vis_predicate_proto.norm(dim=1, keepdim=True)
-
-        vis_rel_dists = vis_rep_norm @ vis_proto_norm.t() * self.vis_logit_scale.exp()
-        vis_vae_loss = VAE_loss(union_features, rec_union_features, mu, log_var)
-        add_losses.update({"vis_vae_loss": vis_vae_loss})
-
-        vis_rel_dists = (vis_rel_dists - vis_rel_dists.mean(dim=1).reshape(-1, 1)) / vis_rel_dists.std(dim=1).reshape(-1, 1)
-        rel_dists2 = rel_dists * self.sigmoid(self.logit_wt2) + vis_rel_dists * (1 - self.sigmoid(self.logit_wt2))
-
-        if self.training:
-            # similarity matrix loss
-            vis_target_proto_norm = vis_proto_norm.clone().detach()
-            vis_simil_mat = vis_proto_norm @ vis_target_proto_norm.t()
-            vis_simi_diff_proto = (vis_simil_mat.sum() - vis_simil_mat.trace()) / (self.num_rel_cls - 1) / (self.num_rel_cls - 1)
-            add_losses.update({"vis_simi_loss": vis_simi_diff_proto})
+            if self.training:
+                # similarity matrix loss
+                vis_target_proto_norm = vis_proto_norm.clone().detach()
+                vis_simil_mat = vis_proto_norm @ vis_target_proto_norm.t()
+                vis_simi_diff_proto = (vis_simil_mat.sum() - vis_simil_mat.trace()) / (self.num_rel_cls - 1) / (self.num_rel_cls - 1)
+                add_losses.update({"vis_simi_loss": vis_simi_diff_proto})
 
         # conceptual prototype
-        ori_con_protos = self.con_protos
-        rec_con_predicate_proto, mu2, log_var2 = self.con_vae(ori_con_protos)  # EDPE
-        con_vae_loss = VAE_loss(ori_con_protos, rec_con_predicate_proto, mu2, log_var2)
-        add_losses.update({"con_vae_loss": con_vae_loss})
-
-        con_predicate_proto = self.con_W_pred(rec_con_predicate_proto)
-        con_rel_rep = self.con_project_head(self.dropout_rel(torch.relu(rel_rep)))
-
-        con_rep_norm = con_rel_rep / con_rel_rep.norm(dim=1, keepdim=True)
-        con_proto_norm = con_predicate_proto / con_predicate_proto.norm(dim=1, keepdim=True)
-
-        con_rel_dists = con_rep_norm @ con_proto_norm.t() * self.con_logit_scale.exp()
-        con_rel_dists = (con_rel_dists - con_rel_dists.mean(dim=1).reshape(-1, 1)) / con_rel_dists.std(dim=1).reshape(-1, 1)
-        rel_dists3 = rel_dists * self.sigmoid(self.logit_wt3) + con_rel_dists * (1 - self.sigmoid(self.logit_wt3))
-
-        if self.training:
-            # similarity matrix loss
-            con_target_proto_norm = con_proto_norm.clone().detach()
-            con_simil_mat = con_proto_norm @ con_target_proto_norm.t()
-            con_simi_diff_proto = (con_simil_mat.sum() - con_simil_mat.trace()) / (self.num_rel_cls - 1) / (self.num_rel_cls - 1)
-            add_losses.update({"con_simi_loss": con_simi_diff_proto})
+        if self.con_pro_mode:
+            ori_con_protos = self.con_protos
+            rec_con_predicate_proto, mu2, log_var2 = self.con_vae(ori_con_protos)  # EDPE
+            con_vae_loss = VAE_loss(ori_con_protos, rec_con_predicate_proto, mu2, log_var2)
+            add_losses.update({"con_vae_loss": con_vae_loss})
+    
+            con_predicate_proto = self.con_W_pred(rec_con_predicate_proto)
+            con_rel_rep = self.con_project_head(self.dropout_rel(torch.relu(rel_rep)))
+    
+            con_rep_norm = con_rel_rep / con_rel_rep.norm(dim=1, keepdim=True)
+            con_proto_norm = con_predicate_proto / con_predicate_proto.norm(dim=1, keepdim=True)
+    
+            con_rel_dists = con_rep_norm @ con_proto_norm.t() * self.con_logit_scale.exp()
+            con_rel_dists = (con_rel_dists - con_rel_dists.mean(dim=1).reshape(-1, 1)) / con_rel_dists.std(dim=1).reshape(-1, 1)
+            rel_dists3 = rel_dists * self.sigmoid(self.logit_wt3) + con_rel_dists * (1 - self.sigmoid(self.logit_wt3))
+    
+            if self.training:
+                # similarity matrix loss
+                con_target_proto_norm = con_proto_norm.clone().detach()
+                con_simil_mat = con_proto_norm @ con_target_proto_norm.t()
+                con_simi_diff_proto = (con_simil_mat.sum() - con_simil_mat.trace()) / (self.num_rel_cls - 1) / (self.num_rel_cls - 1)
+                add_losses.update({"con_simi_loss": con_simi_diff_proto})
 
         rel_dists = rel_dists1 + rel_dists2 + rel_dists3
         rel_dists = rel_dists.split(num_rels, dim=0)
